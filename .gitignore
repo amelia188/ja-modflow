@@ -1,0 +1,16 @@
+# MODFLOW output folders
+mf2005_riocobre_model/
+mf2005_riocobre_model_v20/
+
+# Binary recharge array
+modflowandfiles/rainfall_outputs/recharge_grid_12months.npy
+
+# Data files (large)
+modflowandfiles/*.xlsx
+modflowandfiles/*.tif
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+

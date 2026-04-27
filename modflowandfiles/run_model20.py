@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-this is the most recent version of the modflow model script with dem processing and better displayed outputs.
+my version of this is the most recent version of the modflow model script with dem processing and better displayed outputs.
 """
 
 # -*- coding: utf-8 -*-
@@ -32,8 +32,10 @@ except ModuleNotFoundError as e:
 # ==============================================================================
 
 # File Paths
-SHP_PATH = "Upper_RioCobre_SWMU.shp"
-DEM_PATH = "riocobre2.tif"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SHP_PATH = os.path.join(BASE_DIR, "Upper_RioCobre_SWMU.shp")
+DEM_PATH = os.path.join(BASE_DIR, "riocobre2.tif")
 
 # MODFLOW Executable
 EXE_MF2005 = r"C:\Users\ameli\Github\projects\ja-modflow\mf2005.exe"
@@ -495,7 +497,7 @@ def plot_flow_lines(head, qx, qy, qmag, x_coords, y_coords, calibration_cells=No
     # Streamlines with BETTER VISIBILITY
     strm = ax.streamplot(
         X, Y,
-        qx, qy,
+        qx, -qy,
         density=2.0,  # ← Increased from 1.2 for more streamlines
         color='cyan',  # ← Changed from white - more visible
         linewidth=lw,
@@ -572,7 +574,7 @@ def plot_head_distribution_with_vectors(head, qx, qy, qmag, x_coords, y_coords, 
     # OPTION 1: Scale arrows larger
     Q = ax.quiver(
         X_vecs[valid_mask], Y_vecs[valid_mask],
-        qx_vecs[valid_mask], qy_vecs[valid_mask],
+        qx_vecs[valid_mask], -qy_vecs[valid_mask],
         qmag_vecs[valid_mask],  # Color by magnitude
         cmap='hot',  # Color map for magnitude
         scale=2,  # SMALLER scale = BIGGER arrows
