@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Nov 19 20:41:09 2025
-
-@author: 20002213
+my version of this is the most recent version of the modflow model script with dem processing and better displayed outputs.
 """
 
 # -*- coding: utf-8 -*-
@@ -34,8 +32,10 @@ except ModuleNotFoundError as e:
 # ==============================================================================
 
 # File Paths
-SHP_PATH = "Upper_RioCobre_SWMU.shp"
-DEM_PATH = "riocobre2.tif"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SHP_PATH = os.path.join(BASE_DIR, "Upper_RioCobre_SWMU.shp")
+DEM_PATH = os.path.join(BASE_DIR, "riocobre2.tif")
 
 # MODFLOW Executable
 EXE_MF2005 = r"C:\Users\ameli\Github\projects\ja-modflow\mf2005.exe"
@@ -481,42 +481,54 @@ def plot_flow_lines(head, qx, qy, qmag, x_coords, y_coords, calibration_cells=No
     # Meshgrid
     X, Y = np.meshgrid(x_coords, y_coords)
 
-    plt.figure(figsize=(14, 10))
+    fig, ax = plt.subplots(figsize=(14, 10))
 
-    # Background hydraulic head
-    im = plt.imshow(head_plot, cmap="viridis", origin="upper",
-                    extent=(minx, maxx, miny, maxy), alpha=0.8)
-    plt.colorbar(im, label="Hydraulic Head (m)", shrink=0.8)
+    # Background hydraulic head - LIGHTER to make streamlines more visible
+    im = ax.imshow(head_plot, cmap="viridis", origin="upper",
+                    extent=(minx, maxx, miny, maxy), alpha=0.5)  # ← Reduced alpha
+    plt.colorbar(im, label="Hydraulic Head (m)", shrink=0.8, ax=ax)
 
-    # Scale linewidth by magnitude
-    lw = 3.0 * (qmag / np.nanmax(qmag))
-    lw[np.isnan(lw)] = 0.1
+    # Scale linewidth by magnitude - INCREASED for visibility
+    lw_base = 2.0  # Increased from 3.0
+    lw = lw_base * (qmag / np.nanmax(qmag))
+    lw[np.isnan(lw)] = 0.5
+    lw = np.clip(lw, 0.5, 3.0)  # Ensure minimum and maximum linewidths
 
-    # Streamlines
-    plt.streamplot(
+    # Streamlines with BETTER VISIBILITY
+    strm = ax.streamplot(
         X, Y,
-        qx, qy,
-        density=1.2,
-        color='white',
+        qx, -qy,
+        density=2.0,  # ← Increased from 1.2 for more streamlines
+        color='cyan',  # ← Changed from white - more visible
         linewidth=lw,
-        arrowsize=1.2
+        arrowsize=2.0,  # ← Increased from 1.2 for bigger arrows
+        zorder=2
     )
 
     # Calibration targets
     if calibration_cells:
         for row, col, x, y, target_id in calibration_cells:
-            plt.scatter(x, y, color='red', s=150, marker='*',
-                        edgecolors='white', linewidth=2)
-            plt.annotate(f'{target_id}', (x, y), xytext=(8, 8),
-                         textcoords='offset points', color='white',
-                         fontweight='bold', fontsize=12,
-                         bbox=dict(boxstyle="round,pad=0.3",
-                                   facecolor='red', alpha=0.8))
+            ax.scatter(x, y, color='red', s=200, marker='*',  # ← Increased size
+                        edgecolors='yellow', linewidth=2.5, zorder=3)
+            ax.annotate(f'{target_id}', (x, y), xytext=(10, 10),
+                         textcoords='offset points', color='yellow',  # ← Changed color
+                         fontweight='bold', fontsize=13,
+                         bbox=dict(boxstyle="round,pad=0.4",
+                                   facecolor='red', alpha=0.9),
+                         zorder=3)
 
-    plt.title("Groundwater Flow Lines Derived from Darcy Velocity", fontsize=15, fontweight='bold')
-    plt.xlabel("Easting (m)")
-    plt.ylabel("Northing (m)")
-    plt.grid(alpha=0.3)
+    ax.set_title("Groundwater Flow Lines Derived from Darcy Velocity", 
+                 fontsize=15, fontweight='bold')
+    ax.set_xlabel("Easting (m)", fontsize=12)
+    ax.set_ylabel("Northing (m)", fontsize=12)
+    ax.grid(alpha=0.3, zorder=0, color='white', linestyle='--')
+    
+    # Add text box with flow statistics
+    stats_text = f'Max flow: {np.nanmax(qmag):.2f} m/d\nMean flow: {np.nanmean(qmag):.4f} m/d'
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            verticalalignment='top', fontsize=11,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
     plt.tight_layout()
 
     out = os.path.join(WORKSPACE, "flow_lines_streamplot.png")
@@ -534,47 +546,79 @@ def plot_head_distribution_with_vectors(head, qx, qy, qmag, x_coords, y_coords, 
     head_plot = head[0].copy()
     head_plot[head_plot > 1e20] = np.nan
     
-    plt.figure(figsize=(14, 10))
+    fig, ax = plt.subplots(figsize=(14, 10))
     
     # Head distribution
-    im = plt.imshow(head_plot, cmap="viridis", origin="upper",
-                    extent=(minx, maxx, miny, maxy), alpha=0.8)
-    plt.colorbar(im, label="Hydraulic Head (m)", shrink=0.8)
+    im = ax.imshow(head_plot, cmap="viridis", origin="upper",
+                    extent=(minx, maxx, miny, maxy), alpha=0.6)
+    plt.colorbar(im, label="Hydraulic Head (m)", shrink=0.8, ax=ax)
     
     # Flow vectors (sparse for clarity)
-    stream_density = 5
-    x_vecs, y_vecs = x_coords[::stream_density], y_coords[::stream_density]
+    stream_density = 8  # Sample every 8th cell
+    x_vecs = x_coords[::stream_density]
+    y_vecs = y_coords[::stream_density]
     qx_vecs = qx[::stream_density, ::stream_density]
     qy_vecs = qy[::stream_density, ::stream_density]
     qmag_vecs = qmag[::stream_density, ::stream_density]
     
-    # Mask out vectors with low magnitude
-    min_mag_plot = 1e-4
-    qx_vecs[qmag_vecs < min_mag_plot] = 0.0
-    qy_vecs[qmag_vecs < min_mag_plot] = 0.0
-
-    # Plot vectors
-    plt.quiver(x_vecs, y_vecs, qx_vecs, qy_vecs, 
-               color='white', scale=5, scale_units='dots', 
-               angles='xy', minshaft=2, headwidth=4, headlength=6,
-               alpha=0.8)
+    # Create meshgrid for quiver
+    X_vecs, Y_vecs = np.meshgrid(x_vecs, y_vecs)
+    
+    # CRITICAL: Much lower threshold to show more vectors
+    min_mag_plot = 1e-6  # Changed from 1e-4 to show smaller flows
+    valid_mask = (qmag_vecs >= min_mag_plot) & (~np.isnan(qmag_vecs))
+    
+    print(f"Plotting {np.sum(valid_mask)} flow vectors")
+    print(f"Flow magnitude range in plot: {np.min(qmag_vecs[valid_mask]):.6f} to {np.max(qmag_vecs[valid_mask]):.6f} m/d")
+    
+    # OPTION 1: Scale arrows larger
+    Q = ax.quiver(
+        X_vecs[valid_mask], Y_vecs[valid_mask],
+        qx_vecs[valid_mask], -qy_vecs[valid_mask],
+        qmag_vecs[valid_mask],  # Color by magnitude
+        cmap='hot',  # Color map for magnitude
+        scale=2,  # SMALLER scale = BIGGER arrows
+        scale_units='width',
+        angles='xy',
+        width=0.004,  # Thicker arrow shafts
+        headwidth=5,  # Bigger heads
+        headlength=7,
+        headaxislength=6,
+        alpha=0.9,
+        zorder=2,
+        edgecolors='white',
+        linewidths=0.8
+    )
+    
+    # Add colorbar for magnitude
+    cbar_q = plt.colorbar(Q, label='Flow Magnitude (m/d)', 
+                          shrink=0.8, ax=ax, pad=0.12)
+    
+    # Add reference arrow
+    ax.quiverkey(Q, 0.85, 0.95, 0.5, '0.5 m/d',  # Smaller reference for visibility
+                 labelpos='E', coordinates='axes',
+                 color='yellow', labelcolor='white',
+                 fontproperties={'weight': 'bold', 'size': 12})
     
     # Calibration targets
     if calibration_cells:
         for row, col, x, y, target_id in calibration_cells:
             if head[0, row, col] < 1e20:  # Valid cell
-                plt.scatter(x, y, color='red', s=150, marker='*', 
-                           edgecolors='white', linewidth=2)
-                plt.annotate(f'{target_id}', (x, y), xytext=(8, 8), 
+                ax.scatter(x, y, color='red', s=200, marker='*', 
+                           edgecolors='black', linewidth=1, zorder=3)
+                ax.annotate(f'{target_id}', (x, y), xytext=(8, 8), 
                            textcoords='offset points', color='white',
                            fontweight='bold', fontsize=12,
                            bbox=dict(boxstyle="round,pad=0.3", 
-                                   facecolor='red', alpha=0.8))
+                                   facecolor='red', alpha=0.8),
+                           zorder=3)
     
-    plt.title("Simulated Hydraulic Heads with Darcy Flow Vectors", 
+    ax.set_title("Simulated Hydraulic Heads with Darcy Flow Vectors", 
               fontsize=14, fontweight='bold')
-    plt.xlabel("Easting (m)")
-    plt.ylabel("Northing (m)")
+    ax.set_xlabel("Easting (m)")
+    ax.set_ylabel("Northing (m)")
+    ax.grid(True, alpha=0.3, color='white', linestyle='--', zorder=0)
+    
     plt.tight_layout()
     
     out = os.path.join(WORKSPACE, "head_distribution_with_vectors.png")
@@ -627,14 +671,18 @@ def plot_model_setup():
     """Plot the model setup including grid and topography"""
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
-    # Plot 1: Grid with active cells
-    ax1 = axes[0]
+    # Load shapefile with proper CRS handling
     try:
-        gdf = gpd.read_file(SHP_PATH).to_crs(f'EPSG:{2213}')
-    except:
-        print("Warning: Could not reproject shapefile for plot. Using default CRS.")
+        with rasterio.open(DEM_PATH) as src:
+            dem_crs = src.crs
+        gdf = gpd.read_file(SHP_PATH).to_crs(dem_crs)
+    except Exception as e:
+        print(f"Warning: Could not reproject shapefile: {e}")
         gdf = gpd.read_file(SHP_PATH)
-        
+    
+    # ============ Plot 1: Grid with active cells ============
+    ax1 = axes[0]
+    
     # Plot shapefile outline
     gdf.boundary.plot(ax=ax1, color='black', linewidth=2, label='Watershed boundary')
     
@@ -661,26 +709,57 @@ def plot_model_setup():
     ax1.set_xlim(minx, maxx)
     ax1.set_ylim(miny, maxy)
     ax1.set_aspect('equal')
-    ax1.set_title(f"Model Grid\n{active_count} active cells of {NROW*NCOL} total")
-    ax1.set_xlabel("Easting (m)")
-    ax1.set_ylabel("Northing (m)")
-    ax1.legend()
+    ax1.set_title(f"Model Grid\n{active_count} active cells of {NROW*NCOL} total", 
+                  fontsize=12, fontweight='bold')
+    ax1.set_xlabel("Easting (m)", fontsize=11)
+    ax1.set_ylabel("Northing (m)", fontsize=11)
+    ax1.legend(loc='upper right')
     ax1.grid(True, linestyle='--', alpha=0.3)
     
-    # Plot 2: Topography
+    # ============ Plot 2: Topography ============
     ax2 = axes[1]
-    im = ax2.imshow(TOP_ARR, cmap='terrain', origin='upper', 
-                    extent=[minx, maxx, miny, maxy])
-    plt.colorbar(im, ax=ax2, label='Elevation (m)')
-    gdf.boundary.plot(ax=ax2, color='red', linewidth=2)
-    ax2.set_title("Land Surface Topography")
-    ax2.set_xlabel("Easting (m)")
-    ax2.set_ylabel("Northing (m)")
+    
+    # Plot topography with proper extent
+    TOP_plot = TOP_ARR.copy()
+    # Mask inactive cells for better visualization
+    TOP_plot[IBOUND_MASK_2D == 0] = np.nan
+    
+    im = ax2.imshow(TOP_plot, cmap='terrain', origin='upper', 
+                    extent=[minx, maxx, miny, maxy],
+                    interpolation='bilinear')  # Smooth the display
+    
+    # Colorbar
+    cbar = plt.colorbar(im, ax=ax2, label='Elevation (m)', shrink=0.8)
+    
+    # Overlay shapefile boundary
+    gdf.boundary.plot(ax=ax2, color='red', linewidth=2, label='Watershed boundary')
+    
+    # Add some statistics
+    valid_elev = TOP_ARR[IBOUND_MASK_2D == 1]
+    stats_text = f'Min: {np.min(valid_elev):.0f} m\n'
+    stats_text += f'Max: {np.max(valid_elev):.0f} m\n'
+    stats_text += f'Mean: {np.mean(valid_elev):.0f} m'
+    
+    ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes,
+             verticalalignment='top', fontsize=10,
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    ax2.set_xlim(minx, maxx)
+    ax2.set_ylim(miny, maxy)
+    ax2.set_aspect('equal')
+    ax2.set_title("Land Surface Topography (Active Cells)", 
+                  fontsize=12, fontweight='bold')
+    ax2.set_xlabel("Easting (m)", fontsize=11)
+    ax2.set_ylabel("Northing (m)", fontsize=11)
+    ax2.legend(loc='upper right')
+    ax2.grid(True, linestyle='--', alpha=0.3, color='white')
     
     plt.tight_layout()
     plt.savefig(os.path.join(WORKSPACE, "model_setup.png"), dpi=300, bbox_inches='tight')
     plt.show()
-
+    
+    print(f"✓ Model setup plot saved")
+    
 # ==============================================================================
 # ---------------------------------- MAIN RUN ----------------------------------
 # ==============================================================================
