@@ -1,22 +1,48 @@
 # -*- coding: utf-8 -*-
 """
-my version of this is the most recent version of the modflow model script with dem processing and better displayed outputs.
-"""
+run_modflow_transient_recharge_v21.py
+-------------------------------------
+MODFLOW Single-Layer Transient Model — Upper Rio Cobre Aquifer, Jamaica
 
-# -*- coding: utf-8 -*-
-"""
-MODFLOW Single-Layer Model with Integrated DEM Processing, Varying Thickness, 
-Calibration Targets, and Flow Vector Visualization
-Created on Tue Nov 18 21:00:00 2025
-@author: 20002213
+What this model does:
+  - Builds a 200m x 200m finite difference grid from DEM and watershed shapefile
+  - Runs 1 steady-state spin-up + N_CYCLES years of 12 transient monthly periods
+  - Applies spatially distributed monthly recharge (IDW-interpolated rainfall x 0.17)
+    derived from 26 years of observed rainfall data (2000-2025)
+  - Recharge coefficient 0.17 from Curtis (2025) SWAT water balance calibration
+  - Calibrates against 13 observed heads using the FINAL cycle (end of month)
+  - Produces calibration statistics (RMSE, MAE, R2) and diagnostic plots
+  - Traces groundwater flowlines and exports them as GeoJSON (WGS84) for the
+    HydroWindy web visualizer
+
+Run recharge_model.py first to generate recharge_grid_12months.npy.
+
+Changes from run_modflow_transient_recharge.py (v20 lineage):
+  1. Output control saves the LAST time step of each stress period, so
+     "December" heads are end-of-December (previously day 1 of December).
+  2. Transient year repeated N_CYCLES times; calibration and plots use the
+     final cycle so results no longer depend on the steady-state spin-up.
+     A convergence check compares December heads between the last two cycles.
+  3. Northern boundary is no-flow by default (catchment divide). The previous
+     northern CHD (CH_ELEV + 20 = 72 m) sat below every observed head and
+     drove flow north. Set CH_ELEV_NORTH to a value to restore a CHD.
+  4. Grid cell centres placed at exact DELR/DELC spacing from (minx, maxy),
+     matching how calibration targets and flowlines are georeferenced
+     (previously np.linspace gave slightly non-uniform spacing).
+  5. Streamline plot no longer mirrored north-south.
+  6. Dry/inactive heads (+/-1e30) masked consistently.
+  7. New: flowline tracing (RK2) + GeoJSON export.
+  8. Faster vectorised basin masking and DEM sampling.
 """
 
 import os
+import json
 import shutil
 import numpy as np
 import matplotlib.pyplot as plt
 import geopandas as gpd
 import rasterio
+from rasterio.transform import rowcol
 from shapely.geometry import Point
 
 try:
@@ -24,316 +50,287 @@ try:
     from flopy.utils import HeadFile, CellBudgetFile
 except ModuleNotFoundError as e:
     raise SystemExit(
-        "FloPy is not installed. Install with: conda install -c conda-forge flopy numpy matplotlib pandas"
+        "FloPy is not installed. Install with: conda install -c conda-forge flopy"
     ) from e
 
 # ==============================================================================
-# ----------------------------- CONFIGURATION ----------------------------------
+# CONFIGURATION
 # ==============================================================================
 
-# File Paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+SHP_PATH     = os.path.join(BASE_DIR, "Upper_RioCobre_SWMU.shp")
+DEM_PATH     = os.path.join(BASE_DIR, "riocobre2.tif")
+RECHARGE_NPY = os.path.join(BASE_DIR, "rainfall_outputs", "recharge_grid_12months.npy")
+EXE_MF2005   = r"C:\Users\ameli\Github\projects\ja-modflow\mf2005.exe"
 
-SHP_PATH = os.path.join(BASE_DIR, "Upper_RioCobre_SWMU.shp")
-DEM_PATH = os.path.join(BASE_DIR, "riocobre2.tif")
-
-# MODFLOW Executable
-EXE_MF2005 = r"C:\Users\ameli\Github\projects\ja-modflow\mf2005.exe"
-
-# Workspace setup
-FILE_DIR = os.getcwd()
-WORKSPACE = os.path.join(FILE_DIR, "mf2005_riocobre_model")
+MODEL_NAME = "mf2005_riocobre_v21"
+WORKSPACE  = os.path.join(os.getcwd(), "mf2005_riocobre_v21")
 os.makedirs(WORKSPACE, exist_ok=True)
 
+# Optional: folder of the HydroWindy web project's data directory.
+# If set, flowlines.json is copied there automatically.
+WEB_DATA_DIR = None   # e.g. r"C:\Users\ameli\Github\projects\hydrowindy\data"
+
 # Grid parameters
-DELR = DELC = 200.0              # Cell size in meters (using your working value)
-NLAY = 1                         # Single layer
-MIN_THICKNESS = 10.0             # Minimum thickness required
+DELR = DELC    = 200.0
+NLAY           = 1
+MIN_THICKNESS  = 10.0
+BOTM_ELEVATION = 0.0
 
-# Aquifer bottom (single layer)
-BOTM_ELEVATION = 0.0 
+# Aquifer properties
+HK     = [200.0]  # Horizontal hydraulic conductivity (m/day) — re-check after boundary fix
+VKA    = [200.0]  # Vertical hydraulic conductivity (m/day)
+SY     = [0.20]   # Specific yield (also used as effective porosity for seepage velocity)
+SS     = 1e-5     # Specific storage
+LAYTYP = [1]      # Convertible (unconfined)
 
-# MODFLOW Parameters (Single Layer)
-HK       = [20.0]                # Horizontal K in m/d
-VKA      = [20.0]                # Vertical K in m/d
-SY       = [0.20]                # Specific yield
-SS       = 1e-5                  # Specific storage
-LAYTYP   = [1]                   # Convertible (unconfined)
+# Stress periods: 1 steady-state spin-up + N_CYCLES x 12 transient monthly
+DAYS_PER_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+MONTH_LABELS   = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+N_CYCLES = 3
+NPER     = 1 + 12 * N_CYCLES
+PERLEN   = [365] + DAYS_PER_MONTH * N_CYCLES
+NSTP     = [1] + [30] * (12 * N_CYCLES)
+STEADY   = [True] + [False] * (12 * N_CYCLES)
 
-# Stresses
-RCH_RATE = 1e-4                  # Recharge rate (m/d)
-CBC_UNIT = 53                    # Cell-by-cell budget unit (for flow vectors)
-CH_ELEV  = 5.0                   # Constant Head elevation (m)
+# Boundaries
+CBC_UNIT      = 53
+CH_ELEV_SOUTH = 52.0   # Constant head on southern edge (m)
+CH_ELEV_NORTH = None   # None = no-flow (catchment divide). If used, must exceed ~81 m (max obs head)
+INITIAL_HEAD  = 62.0
 
+# Which month (1-12) of the final cycle to calibrate against / export flowlines for
+CALIB_MONTH    = 12
+FLOWLINE_MONTH = 12
+
+# Flowline tracing
+FLOWLINE_SEED_SPACING = 4      # seed every Nth cell
+FLOWLINE_STEP         = 50.0   # tracer step length (m)
+FLOWLINE_MAX_STEPS    = 3000
+FLOWLINE_MIN_V        = 1e-6   # stop below this seepage velocity (m/day)
+
+# Calibration targets with observed heads (Curtis 2025)
 CALIBRATION_TARGETS = [
-    (748740.4205, 660747.1651),
-    (749538.4976, 661301.9048),
-    (748862.8926, 661688.6217),
-    (748862.8926, 661688.6217),   # duplicate kept only if you want it
-    (746973.2362, 663735.7684),
-    (750878.5184, 661012.7804),
-    (751545.3569, 660868.9354),
-    (751449.8523, 664156.1805),
-    (752455.0110, 665860.7871),
-    (742297.6009, 669060.8732),
-    (748370.4468, 666657.6147),
-    (752487.1230, 662971.9867),
-    (752370.8074, 662119.7216),
-    (745848.6474, 661594.7216)
+    {"id": 1,  "x": 748740.4205, "y": 660747.1651, "obs_head": 77.0},
+    {"id": 2,  "x": 749538.4976, "y": 661301.9048, "obs_head": 77.3},
+    {"id": 3,  "x": 748862.8926, "y": 661688.6217, "obs_head": 77.8},
+    {"id": 4,  "x": 746973.2362, "y": 663735.7684, "obs_head": 78.8},
+    {"id": 5,  "x": 750878.5184, "y": 661012.7804, "obs_head": 77.4},
+    {"id": 6,  "x": 751545.3569, "y": 660868.9354, "obs_head": 77.1},
+    {"id": 7,  "x": 751449.8523, "y": 664156.1805, "obs_head": 78.2},
+    {"id": 8,  "x": 752455.0110, "y": 665860.7871, "obs_head": 79.1},
+    {"id": 9,  "x": 742297.6009, "y": 669060.8732, "obs_head": 81.1},
+    {"id": 10, "x": 748370.4468, "y": 666657.6147, "obs_head": 79.4},
+    {"id": 11, "x": 752487.1230, "y": 662971.9867, "obs_head": 78.0},
+    {"id": 12, "x": 752370.8074, "y": 662119.7216, "obs_head": 77.6},
+    {"id": 13, "x": 745848.6474, "y": 661594.7216, "obs_head": 78.0},
 ]
 
 # ==============================================================================
-# ------------------------------ GRID GENERATION -------------------------------
+# STRESS PERIOD / HEAD HELPERS
+# ==============================================================================
+
+def final_cycle_sp(month):
+    """Stress period index for a month (1-12) in the final transient cycle."""
+    return 1 + 12 * (N_CYCLES - 1) + (month - 1)
+
+
+def kstpkper_end(sp):
+    """(kstp, kper) of the last time step in stress period sp."""
+    return (NSTP[sp] - 1, sp)
+
+
+def get_heads(hds, sp):
+    """End-of-period heads for layer 1 with inactive/dry cells set to NaN."""
+    h = hds.get_data(kstpkper=kstpkper_end(sp))[0].astype(float).copy()
+    h[np.abs(h) > 1e20] = np.nan
+    return h
+
+# ==============================================================================
+# GRID GENERATION
 # ==============================================================================
 
 def assign_dem_to_modflow_top(shapefile_path, dem_path, delr, delc):
-    
-    """
-    DEM processing and grid definition.
-    """
     print("Loading files and harmonizing CRS...")
-    
-    # Load shapefile and DEM info
+
     with rasterio.open(dem_path) as src:
-        dem_crs = src.crs
-        dem_array = src.read(1)
+        dem_crs    = src.crs
+        dem_array  = src.read(1)
         dem_nodata = src.nodata
+        transform  = src.transform
+        dem_h, dem_w = src.height, src.width
 
     gdf = gpd.read_file(shapefile_path).to_crs(dem_crs)
-
-    # Define grid from shapefile bounds
     minx, miny, maxx, maxy = gdf.total_bounds
 
     ncol = int((maxx - minx) / delr)
     nrow = int((maxy - miny) / delc)
 
-    # Generate grid cell centroids
-    x = np.linspace(minx + delr / 2, maxx - delr / 2, ncol)
-    y = np.linspace(maxy - delc / 2, miny + delc / 2, nrow)
-    X, Y = np.meshgrid(x, y)
+    # Exact cell centres (row 0 = north), consistent with target/flowline georeferencing
+    xc = minx + delr * (np.arange(ncol) + 0.5)
+    yc = maxy - delc * (np.arange(nrow) + 0.5)
+    X, Y = np.meshgrid(xc, yc)
 
-    # Mask grid cells inside shapefile
-    mask = np.zeros((nrow, ncol), dtype=bool)
-    for i in range(nrow):
-        for j in range(ncol):
-            point = Point(X[i, j], Y[i, j])
-            if gdf.contains(point).any():
-                mask[i, j] = True
+    # Basin mask (vectorised)
+    try:
+        basin = gdf.union_all()
+    except AttributeError:          # geopandas < 1.0
+        basin = gdf.unary_union
+    try:
+        import shapely
+        mask = np.asarray(shapely.contains_xy(basin, X, Y), dtype=bool)
+    except AttributeError:          # shapely < 2.0
+        from shapely.prepared import prep
+        pb = prep(basin)
+        mask = np.array([[pb.contains(Point(x, y)) for x in xc] for y in yc])
 
-    # Sample DEM values at active cell centroids
+    # DEM sampling (vectorised)
     elevation = np.full((nrow, ncol), np.nan)
-    with rasterio.open(dem_path) as src:
-        for i in range(nrow):
-            for j in range(ncol):
-                if mask[i, j]:
-                    x_coord = X[i, j]
-                    y_coord = Y[i, j]
-                    try:
-                        row, col = src.index(x_coord, y_coord)
-                        if 0 <= row < src.height and 0 <= col < src.width:
-                            val = dem_array[row, col]
-                            if dem_nodata is not None and val == dem_nodata:
-                                elevation[i, j] = np.nan
-                            else:
-                                elevation[i, j] = val
-                    except IndexError:
-                        elevation[i, j] = np.nan
+    ii, jj = np.nonzero(mask)
+    r, c = rowcol(transform, X[ii, jj], Y[ii, jj])
+    r, c = np.asarray(r), np.asarray(c)
+    inb  = (r >= 0) & (r < dem_h) & (c >= 0) & (c < dem_w)
+    vals = np.full(len(ii), np.nan)
+    vals[inb] = dem_array[r[inb], c[inb]]
+    if dem_nodata is not None:
+        vals[vals == dem_nodata] = np.nan
+    elevation[ii, jj] = vals
 
-    # Handle NoData values - use median of active area
     active_elevations = elevation[mask & ~np.isnan(elevation)]
     if len(active_elevations) > 0:
         median_elev = np.median(active_elevations)
-        fill_count = np.sum(np.isnan(elevation) & mask)
+        fill_count  = np.sum(np.isnan(elevation) & mask)
         elevation[np.isnan(elevation) & mask] = median_elev
         print(f"Filled {fill_count} NoData cells with median elevation: {median_elev:.2f} m")
     else:
         elevation[np.isnan(elevation)] = 0.0
         print("WARNING: No valid elevation data found!")
 
-    # Set inactive areas to a background value
     min_active_elev = np.min(elevation[mask]) if np.any(mask) else 0.0
-    TOP_array = np.where(mask, elevation, min_active_elev)
-    ibound_mask_2d = np.where(mask, 1, 0)
+    TOP_array       = np.where(mask, elevation, min_active_elev)
+    ibound_mask_2d  = np.where(mask, 1, 0)
 
-    print(f"Grid Dimensions: {nrow} rows, {ncol} columns")
-    print(f"Active cells: {np.sum(mask)}")
-    print(f"TOP array - Min: {np.min(TOP_array[mask]):.1f} m, Max: {np.max(TOP_array[mask]):.1f} m")
+    print(f"Grid: {nrow} rows x {ncol} cols, {mask.sum()} active cells")
+    print(f"TOP: min={np.min(TOP_array[mask]):.1f} m, "
+          f"max={np.max(TOP_array[mask]):.1f} m")
 
-    return TOP_array, ibound_mask_2d, nrow, ncol, minx, miny, maxx, maxy
+    return TOP_array, ibound_mask_2d, nrow, ncol, minx, maxy, dem_crs.to_wkt()
 
-# Run Grid Generation
-print("Generating model grid from DEM and shapefile...")
-TOP_ARR, IBOUND_MASK_2D, NROW, NCOL, minx, miny, maxx, maxy = \
-    assign_dem_to_modflow_top(SHP_PATH, DEM_PATH, DELR, DELC)
-
-# Thickness enforcement
-min_active_top = np.min(TOP_ARR[IBOUND_MASK_2D == 1]) if np.any(IBOUND_MASK_2D == 1) else BOTM_ELEVATION + MIN_THICKNESS
-
-# Check if the fixed bottom elevation would result in a layer thinner than MIN_THICKNESS
-if BOTM_ELEVATION >= min_active_top - MIN_THICKNESS:
-    suggested_botm = min_active_top - MIN_THICKNESS
-    print(f"\n[GEOMETRY WARNING] Adjusting BOTM from {BOTM_ELEVATION:.1f}m to {suggested_botm:.1f}m")
-    BOTM = [suggested_botm] # Use this single adjusted value
-else:
-    BOTM = [BOTM_ELEVATION] # Use the original fixed bottom value
-
-BOTM_SINGLE_VALUE = BOTM[0] # The single elevation value for BOTM
 
 # ==============================================================================
-# ------------------------ CALIBRATION TARGETS FUNCTIONS -----------------------
+# RECHARGE LOADING
 # ==============================================================================
 
-def find_calibration_cells(calibration_targets, minx, miny, maxx, maxy, nrow, ncol, delr, delc):
-    """
-    Find which grid cells contain calibration targets
-    Returns: list of (row, col, x, y, target_id) for each target
-    """
-    print("\n" + "="*60)
+def load_recharge_array(npy_path, nrow, ncol):
+    """Load monthly recharge array from recharge_model.py output."""
+    if os.path.exists(npy_path):
+        rch = np.load(npy_path)
+        print(f"Loaded recharge array: shape={rch.shape}, "
+              f"mean={np.mean(rch[rch > 0]):.6f} m/day")
+        if rch.shape != (12, nrow, ncol):
+            raise ValueError(
+                f"Recharge array shape {rch.shape} does not match "
+                f"expected (12, {nrow}, {ncol}). Re-run recharge_model.py."
+            )
+        return rch
+    print(f"WARNING: {npy_path} not found. Falling back to uniform 1e-4 m/day.")
+    return np.full((12, nrow, ncol), 1e-4)
+
+
+# ==============================================================================
+# CALIBRATION TARGETS
+# ==============================================================================
+
+def find_calibration_cells(calibration_targets, minx, maxy, nrow, ncol, ibound_2d):
+    print("\n" + "=" * 60)
     print("LOCATING CALIBRATION TARGETS")
-    print("="*60)
-    
-    calibration_cells = []
-    
-    for i, (x_target, y_target) in enumerate(calibration_targets):
-        # Calculate row and column indices
-        col = int((x_target - minx) / delr)
-        row = int((maxy - y_target) / delc)  # Note: y-axis is flipped
-        
-        # Check if within bounds and active
-        if 0 <= row < nrow and 0 <= col < ncol:
-            if IBOUND_MASK_2D[row, col] != 0:
-                 calibration_cells.append((row, col, x_target, y_target, i+1))
-                 print(f"Target {i+1}: ({x_target:.1f}, {y_target:.1f}) → Cell ({row}, {col})")
-            else:
-                 print(f"Target {i+1}: ({x_target:.1f}, {y_target:.1f}) → INACTIVE CELL ({row}, {col})")
-        else:
-            print(f"Target {i+1}: ({x_target:.1f}, {y_target:.1f}) → OUTSIDE GRID BOUNDS")
+    print("=" * 60)
 
-    
-    print(f"\n✓ Located {len(calibration_cells)} calibration targets within active model cells")
+    calibration_cells = []
+    for t in calibration_targets:
+        col = int(np.floor((t['x'] - minx) / DELR))
+        row = int(np.floor((maxy - t['y']) / DELC))
+
+        if 0 <= row < nrow and 0 <= col < ncol:
+            if ibound_2d[row, col] != 0:
+                calibration_cells.append(
+                    (row, col, t['x'], t['y'], t['id'], t['obs_head'])
+                )
+                print(f"Target {t['id']:>2}: ({t['x']:.1f}, {t['y']:.1f}) "
+                      f"-> Cell ({row}, {col}), obs={t['obs_head']:.1f} m")
+            else:
+                print(f"Target {t['id']:>2}: -> INACTIVE CELL")
+        else:
+            print(f"Target {t['id']:>2}: -> OUTSIDE GRID")
+
+    print(f"\n✓ Located {len(calibration_cells)} targets in active cells")
     return calibration_cells
 
-def extract_calibration_heads(head, calibration_cells):
-    """
-    Extract simulated heads at calibration target locations
-    """
-    calibration_data = []
-    
-    for row, col, x, y, target_id in calibration_cells:
-        simulated_head = head[0, row, col]
-        if simulated_head < 1e20:  # Valid cell
-            calibration_data.append({
-                'target_id': target_id,
-                'row': row,
-                'col': col,
-                'x': x,
-                'y': y,
-                'simulated_head': simulated_head,
-                'land_surface': TOP_ARR[row, col],
-                'status': 'VALID'
-            })
-        else:
-            calibration_data.append({
-                'target_id': target_id,
-                'row': row,
-                'col': col,
-                'x': x,
-                'y': y,
-                'simulated_head': np.nan,
-                'land_surface': TOP_ARR[row, col],
-                'status': 'INACTIVE_CELL'
-            })
-    
-    return calibration_data
 
-def plot_calibration_targets(calibration_cells, head=None):
-    """
-    Plot calibration target locations on the model
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-    
-    # Plot 1: Targets on topography
-    ax1 = axes[0]
-    im = ax1.imshow(TOP_ARR, cmap='terrain', origin='upper', 
-                    extent=[minx, maxx, miny, maxy], alpha=0.8)
-    plt.colorbar(im, ax=ax1, label='Elevation (m)')
-    
-    # Plot calibration targets
-    for row, col, x, y, target_id in calibration_cells:
-        ax1.scatter(x, y, color='red', s=100, marker='*', edgecolors='white', linewidth=2)
-        ax1.annotate(f'{target_id}', (x, y), xytext=(5, 5), textcoords='offset points',
-                     fontweight='bold', fontsize=10, color='white',
-                     bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.7))
-    
-    ax1.set_title("Calibration Targets on Topography", fontsize=14, fontweight='bold')
-    ax1.set_xlabel("Easting (m)")
-    ax1.set_ylabel("Northing (m)")
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Targets on simulated heads (if available)
-    ax2 = axes[1]
-    if head is not None:
-        head_plot = head[0].copy()
-        head_plot[head_plot > 1e20] = np.nan
-        im2 = ax2.imshow(head_plot, cmap='viridis', origin='upper',
-                         extent=[minx, maxx, miny, maxy], alpha=0.8)
-        plt.colorbar(im2, ax=ax2, label='Head (m)')
-        plot_title = "Calibration Targets on Simulated Heads"
-    else:
-        # If no head data, just show topography
-        im2 = ax2.imshow(TOP_ARR, cmap='terrain', origin='upper',
-                         extent=[minx, maxx, miny, maxy], alpha=0.8)
-        plt.colorbar(im2, ax=ax2, label='Elevation (m)')
-        plot_title = "Calibration Targets (Heads Not Available)"
-    
-    # Plot calibration targets
-    for row, col, x, y, target_id in calibration_cells:
-        ax2.scatter(x, y, color='red', s=100, marker='*', edgecolors='white', linewidth=2)
-        ax2.annotate(f'{target_id}', (x, y), xytext=(5, 5), textcoords='offset points',
-                     fontweight='bold', fontsize=10, color='white',
-                     bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.7))
-    
-    ax2.set_title(plot_title, fontsize=14, fontweight='bold')
-    ax2.set_xlabel("Easting (m)")
-    ax2.set_ylabel("Northing (m)")
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(WORKSPACE, "calibration_targets.png"), dpi=300, bbox_inches='tight')
-    plt.show()
+def extract_calibration_heads(head_2d, calibration_cells, top_arr):
+    """Extract simulated heads (NaN-masked 2D array) and residuals vs observed."""
+    data = []
+    for row, col, x, y, tid, obs_head in calibration_cells:
+        sim   = head_2d[row, col]
+        valid = not np.isnan(sim)
+        data.append({
+            'target_id':      tid,
+            'row':            row,
+            'col':            col,
+            'x':              x,
+            'y':              y,
+            'observed_head':  obs_head,
+            'simulated_head': float(sim) if valid else np.nan,
+            'residual':       float(sim - obs_head) if valid else np.nan,
+            'land_surface':   top_arr[row, col],
+            'status':         'VALID' if valid else 'DRY/INACTIVE'
+        })
+    return data
+
 
 def export_calibration_data(calibration_data, workspace):
-    """
-    Export calibration data to CSV file
-    """
+    """Export calibration data to CSV and print statistics."""
     import pandas as pd
-    
+
     df = pd.DataFrame(calibration_data)
-    csv_file = os.path.join(workspace, 'calibration_data.csv')
+    csv_file = os.path.join(workspace, 'calibration_results.csv')
     df.to_csv(csv_file, index=False)
-    
-    print(f"✓ Calibration data exported to: {csv_file}")
-    
-    # Print summary
-    valid_targets = [d for d in calibration_data if d['status'] == 'VALID']
-    print(f"\nCalibration Summary:")
-    print(f"  Total targets: {len(calibration_data)}")
-    print(f"  Valid targets: {len(valid_targets)}")
-    
-    if valid_targets:
-        heads = [d['simulated_head'] for d in valid_targets]
-        print(f"  Head range at targets: {min(heads):.1f} to {max(heads):.1f} m")
-        print(f"  Mean head at targets: {np.mean(heads):.1f} m")
-    
-    return csv_file
+    print(f"✓ Calibration data saved: {csv_file}")
+
+    valid = [d for d in calibration_data if d['status'] == 'VALID']
+    if not valid:
+        print("No valid targets — no statistics computed.")
+        return
+
+    sim    = np.array([d['simulated_head'] for d in valid])
+    obs    = np.array([d['observed_head']  for d in valid])
+    res    = sim - obs
+    rmse   = np.sqrt(np.mean(res**2))
+    mae    = np.mean(np.abs(res))
+    ss_res = np.sum((obs - sim)**2)
+    ss_tot = np.sum((obs - np.mean(obs))**2)
+    r2     = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+    print(f"\n{'=' * 40}")
+    print(f"CALIBRATION STATISTICS (end of {MONTH_LABELS[CALIB_MONTH - 1]}, cycle {N_CYCLES})")
+    print(f"{'=' * 40}")
+    print(f"  Valid targets:  {len(valid)}/{len(calibration_data)}")
+    print(f"  RMSE:           {rmse:.3f} m")
+    print(f"  MAE:            {mae:.3f} m")
+    print(f"  R\u00b2:             {r2:.3f}")
+    print(f"  Mean residual:  {np.mean(res):.3f} m")
+    print(f"  Max residual:   {np.max(np.abs(res)):.3f} m")
+    print(f"  Obs range:      {obs.min():.1f} to {obs.max():.1f} m")
+    print(f"  Sim range:      {sim.min():.1f} to {sim.max():.1f} m")
+    print(f"{'=' * 40}")
+
 
 # ==============================================================================
-# --------------------------- MODFLOW FUNCTIONS --------------------------------
+# MODFLOW MODEL BUILD
 # ==============================================================================
 
-def resolve_mf2005_path(explicit_path: str) -> str:
-    
-    """Return a working path to mf2005."""
+def resolve_mf2005_path(explicit_path):
     p = shutil.which("mf2005")
     if p:
         return p
@@ -343,471 +340,503 @@ def resolve_mf2005_path(explicit_path: str) -> str:
         return explicit_path
     raise FileNotFoundError("MODFLOW-2005 executable not found.")
 
-def build_model(model_name: str, dem_top_arr, botm_list, dem_ibound_mask_2d, nlay: int):
-    exe = resolve_mf2005_path(EXE_MF2005)
-    mf = flopy.modflow.Modflow(modelname=model_name, model_ws=WORKSPACE, exe_name=exe)
 
-    # Discretization
+def build_model(model_name, top_arr, botm_list, ibound_mask_2d,
+                nrow, ncol, recharge_array):
+    exe = resolve_mf2005_path(EXE_MF2005)
+    mf  = flopy.modflow.Modflow(modelname=model_name,
+                                model_ws=WORKSPACE, exe_name=exe)
+
+    # DIS
     flopy.modflow.ModflowDis(
-        mf, nlay=nlay, nrow=NROW, ncol=NCOL,
-        delr=DELR, delc=DELC, top=dem_top_arr, botm=botm_list,
-        nper=1, perlen=1.0, nstp=1, steady=True
+        mf, nlay=NLAY, nrow=nrow, ncol=ncol,
+        delr=DELR, delc=DELC, top=top_arr, botm=botm_list,
+        nper=NPER, perlen=PERLEN, nstp=NSTP, steady=STEADY
     )
 
-    # IBOUND (single layer)
-    ibound = np.expand_dims(dem_ibound_mask_2d, axis=0)  # Shape: (1, NROW, NCOL)
-    
-    # Constant Head Boundary on southern edge
+    # BAS — copy so the 2D active mask is not modified in place
+    ibound  = np.expand_dims(ibound_mask_2d, axis=0).copy()
     chd_spd = []
-    # Check only active cells on the southern-most row
-    chd_cols = np.where(ibound[0, NROW - 1, :] == 1)[0]
-    
-    if len(chd_cols) > 0:
-        for j in chd_cols:
-            ibound[0, NROW - 1, j] = -1 # Set to Constant Head
-            chd_spd.append([0, NROW - 1, j, CH_ELEV, CH_ELEV])
-        print(f"Applying {len(chd_spd)} Constant Head cells (H={CH_ELEV}m) on southern boundary.")
-    
-    # Starting heads - use reasonable initial guess
-    active_top = dem_top_arr[dem_ibound_mask_2d == 1]
-    if len(active_top) > 0:
-        initial_head = np.percentile(active_top, 30)  # Conservative initial head
+
+    south_cols = np.where(ibound[0, nrow - 1, :] == 1)[0]
+    for j in south_cols:
+        ibound[0, nrow - 1, j] = -1
+        chd_spd.append([0, nrow - 1, j, CH_ELEV_SOUTH, CH_ELEV_SOUTH])
+    print(f"CHD south: {len(south_cols)} cells (H={CH_ELEV_SOUTH} m)")
+
+    if CH_ELEV_NORTH is not None:
+        north_cols = np.where(ibound[0, 0, :] == 1)[0]
+        for j in north_cols:
+            ibound[0, 0, j] = -1
+            chd_spd.append([0, 0, j, CH_ELEV_NORTH, CH_ELEV_NORTH])
+        print(f"CHD north: {len(north_cols)} cells (H={CH_ELEV_NORTH} m)")
     else:
-        initial_head = CH_ELEV + 10.0
-        
-    strt = np.full((nlay, NROW, NCOL), initial_head, dtype=float)
-    strt = np.where(ibound == 1, strt, 1e30) # Only set start head in active cells
+        print("North boundary: no-flow (catchment divide)")
 
+    strt = np.where(ibound != 0,
+                    np.full((NLAY, nrow, ncol), INITIAL_HEAD), 1e30)
     flopy.modflow.ModflowBas(mf, ibound=ibound, strt=strt, hnoflo=1e30)
-    
-    # Apply CHD package
-    if len(chd_spd) > 0:
-        flopy.modflow.ModflowChd(mf, stress_period_data={0: chd_spd}, ipakcb=CBC_UNIT)
 
-    # LPF Package
+    if chd_spd:
+        flopy.modflow.ModflowChd(
+            mf, stress_period_data={sp: chd_spd for sp in range(NPER)},
+            ipakcb=CBC_UNIT
+        )
+
+    # LPF
     flopy.modflow.ModflowLpf(
-        mf,
-        hk=HK, vka=VKA, laytyp=LAYTYP, sy=SY, ss=SS,
+        mf, hk=HK, vka=VKA, laytyp=LAYTYP, sy=SY, ss=SS,
         laywet=[1], wetfct=0.1, iwetit=1, ihdwet=0, wetdry=[1.0],
         ipakcb=CBC_UNIT
     )
 
-    # Recharge
-    rch_array = np.where(dem_ibound_mask_2d == 1, RCH_RATE, 0.0)
-    flopy.modflow.ModflowRch(mf, rech=rch_array, ipakcb=CBC_UNIT)
+    # RCH: spin-up uses mean annual; transient periods cycle through the 12 months
+    mean_rch = recharge_array.mean(axis=0)
+    rch_spd  = {}
+    for sp in range(NPER):
+        rch_2d = (mean_rch if sp == 0 else recharge_array[(sp - 1) % 12]).copy()
+        rch_2d[ibound[0] == 0]  = 0.0
+        rch_2d[ibound[0] == -1] = 0.0     # no recharge on CHD cells
+        rch_spd[sp] = rch_2d
+    flopy.modflow.ModflowRch(mf, rech=rch_spd, ipakcb=CBC_UNIT)
 
     # Solver
     flopy.modflow.ModflowPcg(
-        mf, hclose=0.01, rclose=1.0, mxiter=2000, iter1=500
+        mf, hclose=0.01, rclose=10.0,
+        mxiter=5000, iter1=1000, relax=0.97
     )
-    
-    # Output control
-    spd = {(0, 0): ["save head", "save budget", "print head", "print budget"]}
-    flopy.modflow.ModflowOc(mf, stress_period_data=spd, compact=True)
 
-    return mf
+    # Output control — save the LAST time step of every stress period.
+    # NOTE: ModflowOc keys are (period, step), the reverse of HeadFile's
+    # kstpkper = (step, period) used in get_heads().
+    flopy.modflow.ModflowOc(
+        mf,
+        stress_period_data={
+            (sp, NSTP[sp] - 1): ["save head", "save budget", "print budget"]
+            for sp in range(NPER)
+        },
+        compact=True
+    )
 
-def run_and_read(mf: "flopy.modflow.Modflow") -> tuple[np.ndarray, CellBudgetFile]:
-    
+    return mf, ibound
+
+
+# ==============================================================================
+# RUN AND READ
+# ==============================================================================
+
+def run_and_read(mf):
     mf.write_input()
     ok, _ = mf.run_model(silent=False, report=True)
+
     if not ok:
         lst = os.path.join(mf.model_ws, f"{mf.name}.list")
         try:
             with open(lst, "r", errors="ignore") as f:
-                print("\n" + "="*40 + "\nMODFLOW LIST FILE TAIL\n" + "="*40)
+                print("\nMODFLOW LIST FILE TAIL\n" + "=" * 40)
                 print("".join(f.readlines()[-200:]))
         except Exception:
             pass
         raise RuntimeError(f"MODFLOW failed for {mf.name}")
-    
-    # Read Heads
+
     hds = HeadFile(os.path.join(mf.model_ws, f"{mf.name}.hds"))
-    head = hds.get_data(kstpkper=(0, 0))
-    
-    # Read Cell-by-Cell Budget (CBC)
-    cbc_file = os.path.join(mf.model_ws, f"{mf.name}.cbc")
-    cbc = CellBudgetFile(cbc_file)
-    
-    return head, cbc
+    cbc = CellBudgetFile(os.path.join(mf.model_ws, f"{mf.name}.cbc"))
+    return hds, cbc
 
-def calculate_flow_vectors(head: np.ndarray, hk: float, delr: float, delc: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Calculate Darcy velocity components (qx, qy) and magnitude using head gradient.
-    """
-    
-    # Head array for layer 1 (shape NROW, NCOL)
-    h_2d = head[0]
-    
-    # Head gradient in X direction
-    dhdx = (h_2d[:, 1:] - h_2d[:, :-1]) / DELR
-    
-    # Head gradient in Y direction
-    dhdy = (h_2d[1:, :] - h_2d[:-1, :]) / DELC
-    
-    # Calculate Darcy velocity components (qx, qy)
-    qx = np.full((NROW, NCOL), np.nan)
-    qy = np.full((NROW, NCOL), np.nan)
-    
-    # QX: Average gradient of faces
+
+def check_cycle_convergence(hds):
+    """Compare end-of-December heads between the last two cycles."""
+    if N_CYCLES < 2:
+        print("Cycle convergence: only 1 cycle — increase N_CYCLES to check.")
+        return
+    sp_last = final_cycle_sp(12)
+    sp_prev = sp_last - 12
+    d = np.abs(get_heads(hds, sp_last) - get_heads(hds, sp_prev))
+    print(f"\nCycle convergence (Dec, cycle {N_CYCLES} vs {N_CYCLES - 1}): "
+          f"max |Δh| = {np.nanmax(d):.3f} m, mean |Δh| = {np.nanmean(d):.3f} m")
+    if np.nanmax(d) > 0.1:
+        print("  NOTE: heads still drifting between cycles — consider increasing N_CYCLES.")
+
+
+# ==============================================================================
+# FLOW VECTORS
+# ==============================================================================
+
+def calculate_flow_vectors(head_2d, ibound_2d, nrow, ncol):
+    """Darcy flux (m/day). qx east-positive; qy positive toward increasing row (south)."""
+    h    = head_2d
+    dhdx = (h[:, 1:] - h[:, :-1]) / DELR
+    dhdy = (h[1:, :] - h[:-1, :]) / DELC
+
+    qx = np.full((nrow, ncol), np.nan)
+    qy = np.full((nrow, ncol), np.nan)
+
     qx[:, 1:-1] = -HK[0] * 0.5 * (dhdx[:, :-1] + dhdx[:, 1:])
-    qx[:, 0] = -HK[0] * dhdx[:, 0]
-    qx[:, -1] = -HK[0] * dhdx[:, -1]
-    
-    # QY: Average gradient of faces
+    qx[:, 0]    = -HK[0] * dhdx[:, 0]
+    qx[:, -1]   = -HK[0] * dhdx[:, -1]
+
     qy[1:-1, :] = -HK[0] * 0.5 * (dhdy[:-1, :] + dhdy[1:, :])
-    qy[0, :] = -HK[0] * dhdy[0, :]
-    qy[-1, :] = -HK[0] * dhdy[-1, :]
-    
-    # Filter inactive and dry cells
-    dry_mask = (h_2d > 1e20) | (IBOUND_MASK_2D == 0)
-    qx[dry_mask] = np.nan
-    qy[dry_mask] = np.nan
-    
-    # Calculate magnitude
-    qmag = np.sqrt(qx**2 + qy**2)
-    
-    return qx, qy, qmag
+    qy[0, :]    = -HK[0] * dhdy[0, :]
+    qy[-1, :]   = -HK[0] * dhdy[-1, :]
 
-def plot_flow_lines(head, qx, qy, qmag, x_coords, y_coords, calibration_cells=None):
-    """
-    Draw groundwater flow lines using Darcy velocity vectors (streamlines).
-    """
-    print("\nPlotting flow lines (streamlines)...")
+    dry     = np.isnan(h) | (ibound_2d == 0)
+    qx[dry] = np.nan
+    qy[dry] = np.nan
 
-    head_plot = head[0].copy()
-    head_plot[head_plot > 1e20] = np.nan
+    return qx, qy, np.sqrt(qx**2 + qy**2)
 
-    # Meshgrid
-    X, Y = np.meshgrid(x_coords, y_coords)
 
-    fig, ax = plt.subplots(figsize=(14, 10))
+# ==============================================================================
+# FLOWLINES → GEOJSON (HydroWindy)
+# ==============================================================================
 
-    # Background hydraulic head - LIGHTER to make streamlines more visible
-    im = ax.imshow(head_plot, cmap="viridis", origin="upper",
-                    extent=(minx, maxx, miny, maxy), alpha=0.5)  # ← Reduced alpha
-    plt.colorbar(im, label="Hydraulic Head (m)", shrink=0.8, ax=ax)
+def trace_flowlines(head_2d, ibound_2d, nrow, ncol, minx, maxy,
+                    seed_spacing=FLOWLINE_SEED_SPACING, step=FLOWLINE_STEP,
+                    max_steps=FLOWLINE_MAX_STEPS, min_v=FLOWLINE_MIN_V):
+    """Trace downgradient streamlines (RK2 midpoint, fixed step in metres).
+    Returns a list of (path_xy[N,2], mean_seepage_velocity_m_per_day)."""
+    from scipy.interpolate import RegularGridInterpolator
 
-    # Scale linewidth by magnitude - INCREASED for visibility
-    lw_base = 2.0  # Increased from 3.0
-    lw = lw_base * (qmag / np.nanmax(qmag))
-    lw[np.isnan(lw)] = 0.5
-    lw = np.clip(lw, 0.5, 3.0)  # Ensure minimum and maximum linewidths
+    qx, qy_south, _ = calculate_flow_vectors(head_2d, ibound_2d, nrow, ncol)
+    vx = qx / SY[0]           # seepage velocity, east-positive
+    vy = -qy_south / SY[0]    # seepage velocity, north-positive
 
-    # Streamlines with BETTER VISIBILITY
-    strm = ax.streamplot(
-        X, Y,
-        qx, -qy,
-        density=2.0,  # ← Increased from 1.2 for more streamlines
-        color='cyan',  # ← Changed from white - more visible
-        linewidth=lw,
-        arrowsize=2.0,  # ← Increased from 1.2 for bigger arrows
-        zorder=2
-    )
+    xc = minx + DELR * (np.arange(ncol) + 0.5)
+    yc = maxy - DELC * (np.arange(nrow) + 0.5)   # descending (row 0 = north)
 
-    # Calibration targets
-    if calibration_cells:
-        for row, col, x, y, target_id in calibration_cells:
-            ax.scatter(x, y, color='red', s=200, marker='*',  # ← Increased size
-                        edgecolors='yellow', linewidth=2.5, zorder=3)
-            ax.annotate(f'{target_id}', (x, y), xytext=(10, 10),
-                         textcoords='offset points', color='yellow',  # ← Changed color
-                         fontweight='bold', fontsize=13,
-                         bbox=dict(boxstyle="round,pad=0.4",
-                                   facecolor='red', alpha=0.9),
-                         zorder=3)
+    fx = RegularGridInterpolator((yc[::-1], xc), vx[::-1],
+                                 bounds_error=False, fill_value=np.nan)
+    fy = RegularGridInterpolator((yc[::-1], xc), vy[::-1],
+                                 bounds_error=False, fill_value=np.nan)
 
-    ax.set_title("Groundwater Flow Lines Derived from Darcy Velocity", 
-                 fontsize=15, fontweight='bold')
-    ax.set_xlabel("Easting (m)", fontsize=12)
-    ax.set_ylabel("Northing (m)", fontsize=12)
-    ax.grid(alpha=0.3, zorder=0, color='white', linestyle='--')
-    
-    # Add text box with flow statistics
-    stats_text = f'Max flow: {np.nanmax(qmag):.2f} m/d\nMean flow: {np.nanmean(qmag):.4f} m/d'
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-            verticalalignment='top', fontsize=11,
+    def vel(p):
+        pt = [[p[1], p[0]]]
+        return np.array([fx(pt)[0], fy(pt)[0]])
+
+    lines = []
+    for i in range(0, nrow, seed_spacing):
+        for j in range(0, ncol, seed_spacing):
+            if ibound_2d[i, j] != 1 or np.isnan(vx[i, j]):
+                continue
+            p = np.array([xc[j], yc[i]])
+            path, speeds = [p.copy()], []
+            for _ in range(max_steps):
+                v1 = vel(p); s1 = np.hypot(*v1)
+                if not np.isfinite(s1) or s1 < min_v:
+                    break
+                v2 = vel(p + 0.5 * step * v1 / s1); s2 = np.hypot(*v2)
+                if not np.isfinite(s2) or s2 < min_v:
+                    break
+                p = p + step * v2 / s2
+                path.append(p.copy()); speeds.append(s2)
+            if len(path) >= 3:
+                lines.append((np.array(path), float(np.mean(speeds))))
+
+    print(f"✓ Traced {len(lines)} flowlines")
+    return lines
+
+
+def export_flowlines_geojson(lines, src_crs_wkt, out_path, step=FLOWLINE_STEP):
+    """Reproject flowlines to WGS84 and write a GeoJSON FeatureCollection."""
+    from pyproj import Transformer
+
+    tf = Transformer.from_crs(src_crs_wkt, "EPSG:4326", always_xy=True)
+    features = []
+    for k, (path, v_mean) in enumerate(lines):
+        lon, lat = tf.transform(path[:, 0], path[:, 1])
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[round(float(a), 6), round(float(b), 6)]
+                                for a, b in zip(lon, lat)]
+            },
+            "properties": {
+                "id": k,
+                "mean_velocity_m_per_day": round(v_mean, 4),
+                "length_m": round((len(path) - 1) * step, 1)
+            }
+        })
+
+    with open(out_path, "w") as f:
+        json.dump({"type": "FeatureCollection", "features": features}, f)
+    print(f"✓ Flowlines GeoJSON saved: {out_path}")
+
+    if WEB_DATA_DIR:
+        os.makedirs(WEB_DATA_DIR, exist_ok=True)
+        dest = os.path.join(WEB_DATA_DIR, "flowlines.json")
+        shutil.copyfile(out_path, dest)
+        print(f"✓ Copied to web project: {dest}")
+
+
+# ==============================================================================
+# PLOTTING
+# ==============================================================================
+
+def plot_seasonal_heads(hds, calibration_cells, extent):
+    print("\nPlotting seasonal head maps (final cycle)...")
+    fig, axes = plt.subplots(3, 4, figsize=(22, 14))
+    axes = axes.flatten()
+
+    xs = [x for _, _, x, y, _, _ in calibration_cells]
+    ys = [y for _, _, x, y, _, _ in calibration_cells]
+
+    for m in range(1, 13):
+        h2d = get_heads(hds, final_cycle_sp(m))
+        ax  = axes[m - 1]
+        im  = ax.imshow(h2d, cmap='viridis', origin='upper', extent=extent)
+        plt.colorbar(im, ax=ax, shrink=0.7, label='Head (m)')
+        ax.scatter(xs, ys, c='red', s=25, edgecolors='white',
+                   linewidths=0.5, zorder=3)
+        ax.set_title(f"{MONTH_LABELS[m - 1]} (end of month)", fontsize=11)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.suptitle(f'Simulated Hydraulic Heads — Monthly, Cycle {N_CYCLES}',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    out = os.path.join(WORKSPACE, 'seasonal_head_maps.png')
+    plt.savefig(out, dpi=200, bbox_inches='tight')
+    plt.show()
+    print(f"✓ Saved: {out}")
+
+
+def plot_head_and_flow(hds, ibound_2d, calibration_cells, nrow, ncol,
+                       minx, maxy, extent, month=12):
+    label = MONTH_LABELS[month - 1]
+    print(f"\nPlotting {label} head + flow streamlines...")
+
+    h2d = get_heads(hds, final_cycle_sp(month))
+    qx, qy, qmag = calculate_flow_vectors(h2d, ibound_2d, nrow, ncol)
+
+    # streamplot needs ascending y; arrays have row 0 = north, so flip them
+    x_coords = minx + DELR * (np.arange(ncol) + 0.5)
+    y_coords = (maxy - nrow * DELC) + DELC * (np.arange(nrow) + 0.5)
+    X, Y     = np.meshgrid(x_coords, y_coords)
+
+    qx_plot = np.flipud(np.where(np.isnan(qx), 0.0, qx))
+    qy_plot = np.flipud(np.where(np.isnan(qy), 0.0, -qy))   # north-positive
+
+    lw = 2.0 * (qmag / np.nanmax(qmag))
+    lw = np.clip(np.where(np.isnan(lw), 0.5, lw), 0.5, 2.5)
+
+    fig, ax = plt.subplots(figsize=(12, 9))
+    im = ax.imshow(h2d, cmap='viridis', origin='upper', extent=extent, alpha=0.5)
+    plt.colorbar(im, ax=ax, label='Hydraulic Head (m)', shrink=0.8)
+
+    ax.streamplot(X, Y, qx_plot, qy_plot, density=1.5, color='cyan',
+                  linewidth=np.flipud(lw), arrowsize=1.5, zorder=2)
+
+    ax.text(0.02, 0.98,
+            f'Darcy flux max: {np.nanmax(qmag):.4f} m/day\n'
+            f'Darcy flux mean: {np.nanmean(qmag):.4f} m/day',
+            transform=ax.transAxes, verticalalignment='top', fontsize=10,
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    
+
+    for _, _, x, y, tid, _ in calibration_cells:
+        ax.scatter(x, y, c='red', s=120, marker='*',
+                   edgecolors='yellow', linewidth=1.5, zorder=3)
+        ax.annotate(str(tid), (x, y), xytext=(6, 6),
+                    textcoords='offset points', color='yellow',
+                    fontsize=9, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.2',
+                              facecolor='red', alpha=0.7), zorder=3)
+
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_title(f'{label} (end of month, cycle {N_CYCLES}) — '
+                 'Hydraulic Head with Groundwater Flow Lines', fontsize=13)
+    ax.set_xlabel('Easting (m)')
+    ax.set_ylabel('Northing (m)')
+    ax.grid(True, alpha=0.2, color='white', linestyle='--')
     plt.tight_layout()
 
-    out = os.path.join(WORKSPACE, "flow_lines_streamplot.png")
+    out = os.path.join(WORKSPACE, f'{label.lower()}_head_flow_streamlines.png')
     plt.savefig(out, dpi=300, bbox_inches='tight')
     plt.show()
+    print(f"✓ Saved: {out}")
 
-    print(f"✓ Flow lines saved: {out}")
 
-def plot_head_distribution_with_vectors(head, qx, qy, qmag, x_coords, y_coords, calibration_cells=None):
-    """
-    Plot head distribution with flow vectors and calibration targets
-    """
-    print("\nPlotting head distribution with flow vectors...")
-    
-    head_plot = head[0].copy()
-    head_plot[head_plot > 1e20] = np.nan
-    
-    fig, ax = plt.subplots(figsize=(14, 10))
-    
-    # Head distribution
-    im = ax.imshow(head_plot, cmap="viridis", origin="upper",
-                    extent=(minx, maxx, miny, maxy), alpha=0.6)
-    plt.colorbar(im, label="Hydraulic Head (m)", shrink=0.8, ax=ax)
-    
-    # Flow vectors (sparse for clarity)
-    stream_density = 8  # Sample every 8th cell
-    x_vecs = x_coords[::stream_density]
-    y_vecs = y_coords[::stream_density]
-    qx_vecs = qx[::stream_density, ::stream_density]
-    qy_vecs = qy[::stream_density, ::stream_density]
-    qmag_vecs = qmag[::stream_density, ::stream_density]
-    
-    # Create meshgrid for quiver
-    X_vecs, Y_vecs = np.meshgrid(x_vecs, y_vecs)
-    
-    # CRITICAL: Much lower threshold to show more vectors
-    min_mag_plot = 1e-6  # Changed from 1e-4 to show smaller flows
-    valid_mask = (qmag_vecs >= min_mag_plot) & (~np.isnan(qmag_vecs))
-    
-    print(f"Plotting {np.sum(valid_mask)} flow vectors")
-    print(f"Flow magnitude range in plot: {np.min(qmag_vecs[valid_mask]):.6f} to {np.max(qmag_vecs[valid_mask]):.6f} m/d")
-    
-    # OPTION 1: Scale arrows larger
-    Q = ax.quiver(
-        X_vecs[valid_mask], Y_vecs[valid_mask],
-        qx_vecs[valid_mask], -qy_vecs[valid_mask],
-        qmag_vecs[valid_mask],  # Color by magnitude
-        cmap='hot',  # Color map for magnitude
-        scale=2,  # SMALLER scale = BIGGER arrows
-        scale_units='width',
-        angles='xy',
-        width=0.004,  # Thicker arrow shafts
-        headwidth=5,  # Bigger heads
-        headlength=7,
-        headaxislength=6,
-        alpha=0.9,
-        zorder=2,
-        edgecolors='white',
-        linewidths=0.8
-    )
-    
-    # Add colorbar for magnitude
-    cbar_q = plt.colorbar(Q, label='Flow Magnitude (m/d)', 
-                          shrink=0.8, ax=ax, pad=0.12)
-    
-    # Add reference arrow
-    ax.quiverkey(Q, 0.85, 0.95, 0.5, '0.5 m/d',  # Smaller reference for visibility
-                 labelpos='E', coordinates='axes',
-                 color='yellow', labelcolor='white',
-                 fontproperties={'weight': 'bold', 'size': 12})
-    
-    # Calibration targets
-    if calibration_cells:
-        for row, col, x, y, target_id in calibration_cells:
-            if head[0, row, col] < 1e20:  # Valid cell
-                ax.scatter(x, y, color='red', s=200, marker='*', 
-                           edgecolors='black', linewidth=1, zorder=3)
-                ax.annotate(f'{target_id}', (x, y), xytext=(8, 8), 
-                           textcoords='offset points', color='white',
-                           fontweight='bold', fontsize=12,
-                           bbox=dict(boxstyle="round,pad=0.3", 
-                                   facecolor='red', alpha=0.8),
-                           zorder=3)
-    
-    ax.set_title("Simulated Hydraulic Heads with Darcy Flow Vectors", 
-              fontsize=14, fontweight='bold')
-    ax.set_xlabel("Easting (m)")
-    ax.set_ylabel("Northing (m)")
-    ax.grid(True, alpha=0.3, color='white', linestyle='--', zorder=0)
-    
+def plot_head_hydrograph(hds, calibration_cells):
+    """Heads at targets through ALL transient cycles (shows spin-up convergence)."""
+    print("\nPlotting head hydrographs...")
+
+    sps   = list(range(1, NPER))
+    heads = np.array([get_heads(hds, sp) for sp in sps])   # (nsp, nrow, ncol)
+    t     = np.arange(1, len(sps) + 1)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    for row, col, x, y, tid, obs_head in calibration_cells:
+        ax.plot(t, heads[:, row, col], marker='o', markersize=3, label=f'Target {tid}')
+
+    for k in range(1, N_CYCLES):
+        ax.axvline(12 * k + 0.5, color='grey', linestyle=':', linewidth=1)
+
+    ax.set_xticks(t)
+    ax.set_xticklabels([MONTH_LABELS[(i - 1) % 12][0] for i in t], fontsize=8)
+    ax.set_title(f'Head at Calibration Targets — {N_CYCLES} transient cycles '
+                 '(dotted lines = cycle boundaries)', fontsize=13)
+    ax.set_xlabel('Month')
+    ax.set_ylabel('Simulated Head (m)')
+    ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=8)
+    ax.grid(True, alpha=0.4)
     plt.tight_layout()
-    
-    out = os.path.join(WORKSPACE, "head_distribution_with_vectors.png")
+
+    out = os.path.join(WORKSPACE, 'calibration_head_hydrographs.png')
     plt.savefig(out, dpi=300, bbox_inches='tight')
     plt.show()
-    
-    print(f"✓ Head distribution plot saved: {out}")
+    print(f"✓ Saved: {out}")
 
-def run_model_and_process_results(model_name: str):
-    # Find calibration target cells
-    calibration_cells = find_calibration_cells(CALIBRATION_TARGETS, minx, miny, maxx, maxy, NROW, NCOL, DELR, DELC)
-    
-    # Plot model setup with calibration targets
-    print("Plotting model setup with calibration targets...")
-    plot_calibration_targets(calibration_cells)
-    
-    # Plot model setup
-    print("Plotting model setup...")
-    plot_model_setup()
-    
-    # Run model
-    try:
-        print("Building MODFLOW model...")
-        model = build_model(model_name, dem_top_arr=TOP_ARR, botm_list=BOTM, 
-                            dem_ibound_mask_2d=IBOUND_MASK_2D, nlay=NLAY)
-        
-        print("Running MODFLOW...")
-        head, cbc = run_and_read(model) 
-        print("✓ MODFLOW completed successfully\n")
-    except RuntimeError as e:
-        print(f"\n[CRITICAL ERROR] Model failed: {e}")
-        return None, None, None, None, None
-    
-    # Extract calibration data
-    calibration_data = extract_calibration_heads(head, calibration_cells)
-    export_calibration_data(calibration_data, WORKSPACE)
-    
-    # Calculate flow vectors
-    print("\nCalculating Darcy flow vectors from head gradients...")
-    qx, qy, qmag = calculate_flow_vectors(head, HK[0], DELR, DELC)
-    print("✓ Flow vectors calculated.")
-    
-    return head, calibration_cells, qx, qy, qmag
 
-# ==============================================================================
-# ---------------------------- PLOTTING FUNCTIONS ------------------------------
-# ==============================================================================
+def plot_calibration_scatter(calibration_data, workspace):
+    """Scatter plot of simulated vs observed heads + residuals bar chart."""
+    print("\nPlotting calibration scatter...")
 
-def plot_model_setup():
-    """Plot the model setup including grid and topography"""
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # Load shapefile with proper CRS handling
-    try:
-        with rasterio.open(DEM_PATH) as src:
-            dem_crs = src.crs
-        gdf = gpd.read_file(SHP_PATH).to_crs(dem_crs)
-    except Exception as e:
-        print(f"Warning: Could not reproject shapefile: {e}")
-        gdf = gpd.read_file(SHP_PATH)
-    
-    # ============ Plot 1: Grid with active cells ============
-    ax1 = axes[0]
-    
-    # Plot shapefile outline
-    gdf.boundary.plot(ax=ax1, color='black', linewidth=2, label='Watershed boundary')
-    
-    # Plot grid cell outlines and highlight active cells
-    active_count = 0
-    for i in range(NROW):
-        for j in range(NCOL):
-            x0 = minx + j * DELR
-            y0 = maxy - (i + 1) * DELC
-            
-            # Draw grid cell outline
-            rect_outline = plt.Rectangle((x0, y0), DELR, DELC,
-                                         edgecolor='gray', facecolor='none', linewidth=0.2)
-            ax1.add_patch(rect_outline)
-            
-            if IBOUND_MASK_2D[i, j] == 1:
-                # Highlight active cells
-                rect_fill = plt.Rectangle((x0, y0), DELR, DELC,
-                                          facecolor='blue', edgecolor='darkblue', 
-                                          linewidth=0.3, alpha=0.6)
-                ax1.add_patch(rect_fill)
-                active_count += 1
-    
-    ax1.set_xlim(minx, maxx)
-    ax1.set_ylim(miny, maxy)
-    ax1.set_aspect('equal')
-    ax1.set_title(f"Model Grid\n{active_count} active cells of {NROW*NCOL} total", 
-                  fontsize=12, fontweight='bold')
-    ax1.set_xlabel("Easting (m)", fontsize=11)
-    ax1.set_ylabel("Northing (m)", fontsize=11)
-    ax1.legend(loc='upper right')
-    ax1.grid(True, linestyle='--', alpha=0.3)
-    
-    # ============ Plot 2: Topography ============
+    valid = [d for d in calibration_data if d['status'] == 'VALID']
+    if not valid:
+        print("No valid targets — skipping scatter.")
+        return
+    obs = np.array([d['observed_head']  for d in valid])
+    sim = np.array([d['simulated_head'] for d in valid])
+    ids = [d['target_id'] for d in valid]
+    res = sim - obs
+
+    rmse   = np.sqrt(np.mean(res**2))
+    ss_res = np.sum((obs - sim)**2)
+    ss_tot = np.sum((obs - np.mean(obs))**2)
+    r2     = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    ax = axes[0]
+    ax.scatter(obs, sim, c='steelblue', s=80,
+               edgecolors='black', linewidths=0.5, zorder=3)
+    for i, tid in enumerate(ids):
+        ax.annotate(str(tid), (obs[i], sim[i]),
+                    xytext=(4, 4), textcoords='offset points', fontsize=8)
+
+    lims = [min(obs.min(), sim.min()) - 1, max(obs.max(), sim.max()) + 1]
+    ax.plot(lims, lims, 'r--', linewidth=1.5, label='1:1 line')
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.set_xlabel('Observed Head (m)', fontsize=12)
+    ax.set_ylabel('Simulated Head (m)', fontsize=12)
+    ax.set_title(f'Simulated vs Observed — end of {MONTH_LABELS[CALIB_MONTH - 1]}',
+                 fontsize=13)
+    ax.legend()
+    ax.grid(True, alpha=0.4)
+    ax.text(0.05, 0.95,
+            f'RMSE = {rmse:.2f} m\nR\u00b2 = {r2:.3f}\nn = {len(valid)}',
+            transform=ax.transAxes, verticalalignment='top', fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
     ax2 = axes[1]
-    
-    # Plot topography with proper extent
-    TOP_plot = TOP_ARR.copy()
-    # Mask inactive cells for better visualization
-    TOP_plot[IBOUND_MASK_2D == 0] = np.nan
-    
-    im = ax2.imshow(TOP_plot, cmap='terrain', origin='upper', 
-                    extent=[minx, maxx, miny, maxy],
-                    interpolation='bilinear')  # Smooth the display
-    
-    # Colorbar
-    cbar = plt.colorbar(im, ax=ax2, label='Elevation (m)', shrink=0.8)
-    
-    # Overlay shapefile boundary
-    gdf.boundary.plot(ax=ax2, color='red', linewidth=2, label='Watershed boundary')
-    
-    # Add some statistics
-    valid_elev = TOP_ARR[IBOUND_MASK_2D == 1]
-    stats_text = f'Min: {np.min(valid_elev):.0f} m\n'
-    stats_text += f'Max: {np.max(valid_elev):.0f} m\n'
-    stats_text += f'Mean: {np.mean(valid_elev):.0f} m'
-    
-    ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes,
-             verticalalignment='top', fontsize=10,
-             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    
-    ax2.set_xlim(minx, maxx)
-    ax2.set_ylim(miny, maxy)
-    ax2.set_aspect('equal')
-    ax2.set_title("Land Surface Topography (Active Cells)", 
-                  fontsize=12, fontweight='bold')
-    ax2.set_xlabel("Easting (m)", fontsize=11)
-    ax2.set_ylabel("Northing (m)", fontsize=11)
-    ax2.legend(loc='upper right')
-    ax2.grid(True, linestyle='--', alpha=0.3, color='white')
-    
+    colors = ['tomato' if r > 0 else 'steelblue' for r in res]
+    ax2.bar([str(i) for i in ids], res,
+            color=colors, edgecolor='black', linewidth=0.5)
+    ax2.axhline(0, color='black', linewidth=1)
+    ax2.set_xlabel('Target ID', fontsize=12)
+    ax2.set_ylabel('Residual — Simulated minus Observed (m)', fontsize=12)
+    ax2.set_title('Head Residuals at Calibration Targets', fontsize=13)
+    ax2.grid(True, alpha=0.4, axis='y')
+
+    from matplotlib.patches import Patch
+    ax2.legend(handles=[
+        Patch(facecolor='tomato',    label='Overestimated (Sim > Obs)'),
+        Patch(facecolor='steelblue', label='Underestimated (Sim < Obs)')
+    ], fontsize=9)
+
     plt.tight_layout()
-    plt.savefig(os.path.join(WORKSPACE, "model_setup.png"), dpi=300, bbox_inches='tight')
+    out = os.path.join(workspace, 'calibration_scatter.png')
+    plt.savefig(out, dpi=300, bbox_inches='tight')
     plt.show()
-    
-    print(f"✓ Model setup plot saved")
-    
+    print(f"✓ Saved: {out}")
+
+
 # ==============================================================================
-# ---------------------------------- MAIN RUN ----------------------------------
+# MAIN
 # ==============================================================================
 
 def main():
-    print(f"\n{'='*60}")
-    print(f"MODFLOW Single-Layer Model: Rio Cobre Aquifer")
-    print(f"{'='*60}\n")
-    print(f"Layer Bottom Elevation: {BOTM_SINGLE_VALUE} m")
-    
-    # Execute model run and initial processing
-    head, calibration_cells, qx, qy, qmag = run_model_and_process_results("mf2005_riocobre")
-    
-    if head is None:
-        return
-    
-    # Create coordinate arrays
-    x_coords = np.arange(NCOL) * DELR + minx + DELR/2
-    y_coords = np.arange(NROW) * DELC + miny + DELC/2
-    
-    # Generate plots
-    plot_flow_lines(head, qx, qy, qmag, x_coords, y_coords, calibration_cells)
-    plot_head_distribution_with_vectors(head, qx, qy, qmag, x_coords, y_coords, calibration_cells)
-    
+    print(f"\n{'=' * 60}")
+    print("MODFLOW Transient Recharge Model — Upper Rio Cobre (v21)")
+    print(f"{'=' * 60}\n")
+
+    # Grid
+    print("Generating model grid...")
+    TOP_ARR, IBOUND_2D, NROW, NCOL, minx, maxy, crs_wkt = \
+        assign_dem_to_modflow_top(SHP_PATH, DEM_PATH, DELR, DELC)
+    EXTENT = [minx, minx + NCOL * DELR, maxy - NROW * DELC, maxy]
+
+    # Thickness check
+    min_active_top = np.min(TOP_ARR[IBOUND_2D == 1])
+    if BOTM_ELEVATION >= min_active_top - MIN_THICKNESS:
+        BOTM = [min_active_top - MIN_THICKNESS]
+        print(f"[GEOMETRY] Adjusted BOTM to {BOTM[0]:.1f} m")
+    else:
+        BOTM = [BOTM_ELEVATION]
+    print(f"Layer bottom: {BOTM[0]:.1f} m")
+
+    # Recharge
+    print("\nLoading recharge array...")
+    recharge_array = load_recharge_array(RECHARGE_NPY, NROW, NCOL)
+
+    # Calibration targets
+    calibration_cells = find_calibration_cells(
+        CALIBRATION_TARGETS, minx, maxy, NROW, NCOL, IBOUND_2D
+    )
+
+    # Build and run
+    print("\nBuilding MODFLOW model...")
+    mf, IBOUND_3D = build_model(MODEL_NAME, TOP_ARR, BOTM, IBOUND_2D,
+                                NROW, NCOL, recharge_array)
+    IBOUND_MODEL = IBOUND_3D[0]   # includes -1 for CHD cells
+
+    print("Running MODFLOW...")
+    hds, cbc = run_and_read(mf)
+    print("✓ MODFLOW completed successfully")
+
+    check_cycle_convergence(hds)
+
+    # Calibration on final cycle
+    h_cal    = get_heads(hds, final_cycle_sp(CALIB_MONTH))
+    cal_data = extract_calibration_heads(h_cal, calibration_cells, TOP_ARR)
+    export_calibration_data(cal_data, WORKSPACE)
+
+    # Plots
+    plot_seasonal_heads(hds, calibration_cells, EXTENT)
+    plot_head_and_flow(hds, IBOUND_MODEL, calibration_cells, NROW, NCOL,
+                       minx, maxy, EXTENT, month=CALIB_MONTH)
+    plot_head_hydrograph(hds, calibration_cells)
+    plot_calibration_scatter(cal_data, WORKSPACE)
+
+    # Flowlines for HydroWindy
+    print("\nTracing flowlines for web export...")
+    h_flow = get_heads(hds, final_cycle_sp(FLOWLINE_MONTH))
+    lines  = trace_flowlines(h_flow, IBOUND_MODEL, NROW, NCOL, minx, maxy)
+    export_flowlines_geojson(lines, crs_wkt,
+                             os.path.join(WORKSPACE, "flowlines.json"))
+
     # Summary
-    print(f"\n{'='*60}")
+    valid_heads = [d['simulated_head'] for d in cal_data if d['status'] == 'VALID']
+    print(f"\n{'=' * 60}")
     print("MODEL SUMMARY")
-    print(f"{'='*60}")
-    print(f"Grid: {NROW} rows × {NCOL} columns × {NLAY} layer")
-    print(f"Cell size: {DELR} m × {DELC} m")
-    print(f"Active cells: {np.sum(IBOUND_MASK_2D == 1)}")
-    print(f"Layer Bottom: {BOTM_SINGLE_VALUE} m")
-    
-    print(f"\nAquifer properties: K={HK[0]} m/d, Sy={SY[0]}")
-    
-    valid_heads = head[head < 1e20]
-    if len(valid_heads) > 0:
-        print(f"Head range: {np.min(valid_heads):.1f} to {np.max(valid_heads):.1f} m")
-    
-    # Flow Vector Summary
-    valid_qmag = qmag[~np.isnan(qmag)]
-    if len(valid_qmag) > 0:
-        print(f"\nDarcy Velocity (Active Cells):")
-        print(f"  Range: {np.min(valid_qmag):.4f} to {np.max(valid_qmag):.4f} m/d")
-        print(f"  Mean: {np.mean(valid_qmag):.4f} m/d")
-    
-    print(f"\n✓ MODEL COMPLETE")
-    print(f"Results in: {WORKSPACE}")
+    print(f"{'=' * 60}")
+    print(f"Grid:           {NROW} rows x {NCOL} cols x {NLAY} layer")
+    print(f"Cell size:      {DELR} m x {DELC} m")
+    print(f"Active cells:   {np.sum(IBOUND_2D == 1)}")
+    print(f"Stress periods: {NPER} (1 spin-up + {N_CYCLES} x 12 monthly transient)")
+    print(f"Recharge:       spatially distributed (IDW, 0.17 x rainfall)")
+    print(f"K:              {HK[0]} m/d,  Sy: {SY[0]}")
+    print(f"CHD south:      {CH_ELEV_SOUTH} m")
+    print(f"North boundary: {'no-flow' if CH_ELEV_NORTH is None else f'CHD {CH_ELEV_NORTH} m'}")
+    if valid_heads:
+        print(f"Head range ({MONTH_LABELS[CALIB_MONTH - 1]}, cycle {N_CYCLES}): "
+              f"{min(valid_heads):.1f} to {max(valid_heads):.1f} m")
+    print(f"Flowlines:      {len(lines)} exported")
+    print(f"Results:        {WORKSPACE}")
+    print("✓ MODEL COMPLETE")
+
 
 if __name__ == "__main__":
     main()
