@@ -14,3 +14,22 @@ __pycache__/
 *.pyc
 *.pyo
 
+# --- model outputs (rebuild them by running the scripts) ---
+runs/
+mf2005_*/
+**/hydrowindy_data/
+hydro-windy-app/data/*.json
+*.hds
+*.cbc
+*.lst
+*.list
+*.ucn
+# --- binaries and caches ---
+*.exe
+mf6
+mf2005
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db

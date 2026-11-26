@@ -1,0 +1,9 @@
+# Plausible parameter ranges for the Upper Rio Cobre model (layer 1 = White Limestone karst aquifer).
+# k in m/day, ss in 1/m, sy dimensionless. Lines starting with # are ignored.
+# k: karst limestone 1e-6 to 1e-2 m/s (Freeze & Cherry 1979, Table 2.2) = 0.086 to 864 m/day.
+# ss and sy: GENERAL PLACEHOLDERS, not site values. Replace them with ranges from Wishart (2001),
+# pumping tests or Curtis (2025) and cite the source in the last column before reporting.
+param,layer,min,max,source
+k,1,0.086,864,Freeze & Cherry (1979) Table 2.2 karst limestone
+ss,1,1e-6,1e-4,placeholder: replace with site value
+sy,1,0.01,0.25,placeholder: replace with site value

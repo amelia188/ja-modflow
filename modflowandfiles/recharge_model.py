@@ -14,7 +14,7 @@ Pipeline:
 Recharge = mean monthly rainfall * 0.17 / 1000 / days_in_month  [m/day]
 (coefficient from Curtis 2025, Table 4.8 - SWAT water balance)
 
-Run this BEFORE run_model19.py.
+Run this BEFORE run_model.py.
 """
 
 import os
@@ -42,7 +42,7 @@ DEM_PATH      = os.path.join(BASE_DIR, "riocobre2.tif")
 OUTPUT_DIR    = os.path.join(BASE_DIR, "rainfall_outputs")
 RECHARGE_NPY  = os.path.join(OUTPUT_DIR, "recharge_grid_12months.npy")
 
-# MODFLOW grid (must match run_model19.py)
+# MODFLOW grid (must match run_model.py)
 DELR = DELC = 200.0
 
 # Month metadata
@@ -58,7 +58,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ==============================================================================
-# STEP 1 — BUILD MODFLOW GRID (same logic as run_model19.py)
+# STEP 1 — BUILD MODFLOW GRID (same logic as run_model.py)
 # ==============================================================================
 
 def build_modflow_grid(shp_path, dem_path, delr, delc):
@@ -77,8 +77,10 @@ def build_modflow_grid(shp_path, dem_path, delr, delc):
     ncol = int((maxx - minx) / delr)
     nrow = int((maxy - miny) / delc)
 
-    x = np.linspace(minx + delr / 2, maxx - delr / 2, ncol)
-    y = np.linspace(maxy - delc / 2, miny + delc / 2, nrow)
+    # Exact 200 m cell centres from the north-west corner, as in run_model.py (v21+).
+    # (np.linspace(minx + delr/2, maxx - delr/2, ncol) stretched the spacing to fit the bounds.)
+    x = minx + delr * (np.arange(ncol) + 0.5)
+    y = maxy - delc * (np.arange(nrow) + 0.5)
     X, Y = np.meshgrid(x, y)
 
     mask = np.zeros((nrow, ncol), dtype=bool)
